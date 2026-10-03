@@ -5,8 +5,26 @@ import os
 import uuid
 import traceback
 
+# ------------------------------------------------------------------
+# NOTE: this is a STANDALONE scratch server for testing Whisper on its
+# own. It is NOT what the Streamlit app talks to -- that is the
+# /transcribe endpoint in backend/main.py, which also does language
+# detection and the wrong-script guard.
+#
+# It used to listen on port 8000, the same port uvicorn serves the real
+# backend on, while expecting the upload field "audio" where the real
+# backend expects "file". Starting this instead of the backend therefore
+# answered the app's requests with
+#     400 "No audio file received. Expected field name: audio"
+# which looks exactly like a broken frontend. It now uses port 8001 and
+# accepts either field name.
+# ------------------------------------------------------------------
+
 app = Flask(__name__)
 CORS(app)
+
+PORT = 8001
+UPLOAD_FIELDS = ("file", "audio")
 
 print("Loading Whisper model...")
 
@@ -30,13 +48,16 @@ def transcribe():
         print("Content-Type:", request.content_type)
         print("Received files:", list(request.files.keys()))
 
-        if "audio" not in request.files:
+        field = next((f for f in UPLOAD_FIELDS if f in request.files), None)
+
+        if field is None:
             return jsonify({
                 "success": False,
-                "error": "No audio file received. Expected field name: audio"
+                "error": "No audio file received. Expected field name: "
+                         + " or ".join(UPLOAD_FIELDS)
             }), 400
 
-        audio_file = request.files["audio"]
+        audio_file = request.files[field]
 
         if audio_file.filename == "":
             return jsonify({
@@ -54,7 +75,10 @@ def transcribe():
 
         os.makedirs(temp_dir, exist_ok=True)
 
-        filename = f"{uuid.uuid4().hex}.wav"
+        # keep the real extension instead of claiming every upload is a WAV
+        extension = os.path.splitext(audio_file.filename)[1].lower() or ".wav"
+
+        filename = f"{uuid.uuid4().hex}{extension}"
 
         audio_path = os.path.join(temp_dir, filename)
 
@@ -141,14 +165,16 @@ def home():
         "status": "Whisper API is running",
         "endpoint": "/transcribe",
         "method": "POST",
-        "field": "audio"
+        "field": " or ".join(UPLOAD_FIELDS),
+        "port": PORT,
+        "note": "Scratch test server. The app uses backend/main.py on port 8000."
     })
 
 
 if __name__ == "__main__":
 
     app.run(
-        host="0.0.0.0",
-        port=8000,
+        host="127.0.0.1",
+        port=PORT,
         debug=True
     )

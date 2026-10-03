@@ -4,3 +4,11 @@ requests
 python-multipart
 openai-whisper
 torch
+numpy
+
+# NOTE: openai-whisper also needs the ffmpeg BINARY, which pip cannot install.
+#   Windows        winget install Gyan.FFmpeg
+#   macOS          brew install ffmpeg
+#   Debian/Ubuntu  sudo apt install ffmpeg
+# Without it every /transcribe request fails. GET /health reports whether
+# the backend found it.

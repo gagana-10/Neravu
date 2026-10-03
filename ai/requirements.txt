@@ -1,0 +1,18 @@
+# Standalone scripts in this folder. Not needed to run the app itself --
+# backend/requirements.txt covers that.
+
+# rag.py
+scikit-learn
+
+# testai.py
+requests
+
+# test_whisper.py
+openai-whisper
+
+# whisper_api.py (scratch Whisper server, port 8001)
+flask
+flask-cors
+
+# whisper_api.py and test_whisper.py also need the ffmpeg binary --
+# see backend/requirements.txt for install commands.

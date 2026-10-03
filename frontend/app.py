@@ -55,7 +55,25 @@ defaults = {
     "voice_debug": None,
     "voice_warning": None,
     "voice_mismatch": False,
+    # these were read with .get() but never declared or cleared, so a failed
+    # recording left the PREVIOUS clip's numbers on screen
+    "voice_probs": {},
+    "voice_supported_mass": None,
+    "voice_forced": False,
+    "voice_low_confidence": False,
 }
+
+# every key a transcription owns -- reset as a group before each new attempt
+VOICE_KEYS = [
+    "voice_text", "voice_lang", "voice_reply", "voice_reply_lang",
+    "voice_debug", "voice_warning", "voice_mismatch", "voice_probs",
+    "voice_supported_mass", "voice_forced", "voice_low_confidence",
+]
+
+
+def reset_voice_state():
+    for key in VOICE_KEYS:
+        st.session_state[key] = defaults[key]
 
 for key, value in defaults.items():
     if key not in st.session_state:
@@ -306,17 +324,21 @@ elif st.session_state.page == "voice":
             use_container_width=True,
         ):
 
+            # drop the previous clip's text, warning and confidence numbers
+            # before asking for new ones, so nothing stale survives a failure
+            reset_voice_state()
+
             with st.spinner("🎧 Neravu is listening..."):
 
                 try:
                     response = requests.post(
                         f"{BACKEND_URL}/transcribe",
 
-                        # FIX 1: field name must be "file" (backend: file=File(...))
+                        # field name must be "file" (backend: file=File(...))
                         files={"file": ("voice.wav", audio_value.getvalue(), "audio/wav")},
 
-                        # FIX 2: send the sidebar language as a *hint* only.
-                        # Whisper still detects what was really spoken.
+                        # the sidebar language is a *hint* only; Whisper still
+                        # detects what was really spoken
                         data={
                             "language": st.session_state.language,
                             "force": "1" if force_app_language else "0",
@@ -325,23 +347,34 @@ elif st.session_state.page == "voice":
                         timeout=300,
                     )
 
-                    if response.status_code != 200:
-                        st.error(f"Whisper server error: {response.status_code} {response.text[:200]}")
+                    # the backend now returns 4xx/5xx on failure, with the
+                    # readable reason in the JSON body rather than raw text
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        data = None
+
+                    if data is None:
+                        st.error(
+                            f"Whisper server error {response.status_code}: "
+                            f"{response.text[:200]}"
+                        )
+
+                    elif data.get("success"):
+                        st.session_state.voice_text = data.get("text", "").strip()
+                        st.session_state.voice_lang = data.get("language", "en")
+                        st.session_state.voice_probs = data.get("probabilities", {})
+                        st.session_state.voice_supported_mass = data.get("supported_mass")
+                        st.session_state.voice_warning = data.get("warning")
+                        st.session_state.voice_mismatch = data.get("hint_mismatch", False)
+                        st.session_state.voice_forced = data.get("forced", False)
+                        st.session_state.voice_low_confidence = data.get(
+                            "low_confidence", False
+                        )
+                        st.success("✅ Speech converted successfully!")
 
                     else:
-                        data = response.json()
-
-                        if data.get("success"):
-                            st.session_state.voice_text = data.get("text", "").strip()
-                            st.session_state.voice_lang = data.get("language", "en")
-                            st.session_state.voice_reply = ""
-                            st.session_state.voice_probs = data.get("probabilities", {})
-                            st.session_state.voice_warning = data.get("warning")
-                            st.session_state.voice_mismatch = data.get("hint_mismatch", False)
-                            st.success("✅ Speech converted successfully!")
-                        else:
-                            # FIX: backend key is "error", not "message"
-                            st.error(data.get("error", "Whisper could not process the audio."))
+                        st.error(data.get("error", "Whisper could not process the audio."))
 
                 except requests.exceptions.ConnectionError:
                     st.error("❌ Cannot connect to Neravu backend.")
@@ -372,21 +405,50 @@ elif st.session_state.page == "voice":
                 st.warning(st.session_state.voice_warning)
 
             if st.session_state.get("voice_mismatch"):
-                st.info(
-                    f"I heard **{heard_lang}**, but the app language is "
-                    f"**{st.session_state.language}**. If you actually spoke "
-                    f"{st.session_state.language}, tick the 'Force speech recognition' "
-                    "box above and record again."
-                )
+                if st.session_state.get("voice_forced"):
+                    # this case used to be impossible to reach: forcing
+                    # overwrote the detection, so a mis-heard forced clip
+                    # reported no mismatch at all
+                    st.warning(
+                        f"Speech recognition was forced to "
+                        f"**{st.session_state.language}**, but what I actually "
+                        f"heard sounded more like **{heard_lang}**. Check the "
+                        "text above carefully."
+                    )
+                else:
+                    st.info(
+                        f"I heard **{heard_lang}**, but the app language is "
+                        f"**{st.session_state.language}**. If you actually spoke "
+                        f"{st.session_state.language}, tick the 'Force speech "
+                        "recognition' box above and record again."
+                    )
 
-            st.write(f"Detected spoken language: **{heard_lang}**")
+            if st.session_state.get("voice_forced"):
+                st.write(f"Transcribed as: **{st.session_state.language}** (forced)")
+            else:
+                st.write(f"Detected spoken language: **{heard_lang}**")
 
             probs = st.session_state.get("voice_probs")
             if probs:
+                # These are raw Whisper probabilities over all 99 languages it
+                # knows, filtered down to our six -- they do NOT add up to
+                # 100%. Rendering them as bare percentages implied they did,
+                # so the share that landed outside Neravu's languages is now
+                # shown alongside them.
                 st.caption(
                     "Whisper confidence: "
-                    + ", ".join(f"{CODE_TO_NAME.get(c, c)} {p:.0%}" for c, p in probs.items())
+                    + ", ".join(
+                        f"{CODE_TO_NAME.get(c, c)} {p:.0%}" for c, p in probs.items()
+                    )
                 )
+
+                mass = st.session_state.get("voice_supported_mass")
+                if mass is not None:
+                    st.caption(
+                        f"Only {mass:.0%} of Whisper's certainty landed on a "
+                        "language Neravu supports; the rest went to languages "
+                        "it does not handle."
+                    )
 
             # ---------------------------------------------
             # ASK NERAVU
