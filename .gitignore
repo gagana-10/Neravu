@@ -1,0 +1,42 @@
+# Python virtual environments
+venv/
+env/
+.venv/
+*/venv/
+*/env/
+*/.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment/secrets
+.env
+*.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Whisper/audio files
+*.wav
+*.mp3
+*.m4a
+*.webm
+
+# Temporary files
+temp_audio.*
+tmp/
+temp/
+
+# VS Code
+.vscode/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS files
+.DS_Store
+Thumbs.db
