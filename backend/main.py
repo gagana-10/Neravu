@@ -4,14 +4,18 @@
 # ============================================================
 
 import os
+import shutil
 import tempfile
 import requests
 import time
+
+import numpy as np
 import torch
 import whisper
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 
 app = FastAPI(title="Neravu AI Backend", version="1.1")
@@ -40,14 +44,11 @@ TRANSLATE_MODEL = os.getenv("TRANSLATE_MODEL", "translategemma:4b")
 # False : Qwen answers directly in the target language (faster, less reliable)
 USE_TRANSLATION_PIPELINE = os.getenv("USE_TRANSLATION_PIPELINE", "1") == "1"
 
-# "small" is weak for Kannada and often mistakes it for Hindi/Telugu.
-# Use "medium" (good balance) or "large-v3" (best, needs ~10 GB RAM/VRAM).
-# Override without editing code:  set WHISPER_MODEL=large-v3
-# Default: "medium" only if a GPU is available, otherwise "small" (CPU-friendly).
-HAS_GPU = torch.cuda.is_available()
-# "small" writes Kannada as Devanagari gibberish. Use "medium" at minimum.
-# If medium is too slow on your PC:  set WHISPER_MODEL=small  (accuracy drops a lot)
+# "small" is weak for Kannada and writes it as Devanagari gibberish, so the
+# default is "medium" on every machine, GPU or not.
+# Faster but much less accurate:  set WHISPER_MODEL=small
 # Best accuracy (needs ~10 GB RAM/VRAM):  set WHISPER_MODEL=large-v3
+HAS_GPU = torch.cuda.is_available()
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "medium")
 
 # If the user picked an Indian language in the app and Whisper's top guess is a
@@ -55,6 +56,38 @@ WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "medium")
 # it at least this fraction of the top guess's probability.
 # (Fixes Kannada being detected as Hindi/Telugu. English is never overridden.)
 HINT_BIAS = 0.25
+
+# Whisper spreads its language probabilities over all 99 languages it knows.
+# If the best of OUR six scores below this, the clip is almost certainly
+# silence, background noise, or a language Neravu does not support. Picking
+# the argmax of six near-zero floats is a coin toss, which is how a silent
+# recording used to come back as a confident language detection.
+MIN_LANG_CONFIDENCE = 0.10
+
+# Raw speech-to-text is held to a looser script standard than generated text.
+# Elderly Indian speech routinely mixes in English words - "sugar", "BP",
+# "tablet", "doctor" - and transcribing those in Latin letters is CORRECT,
+# not a wrong-script error. At the old 0.9 threshold such a transcription was
+# rejected and the user was told it had been misunderstood.
+#
+# Measured on sample Kannada sentences:
+#     pure Kannada ................................ 1.00
+#     one English word mixed in ................... 0.75
+#     two English words mixed in .................. 0.54
+#     WRONG - Devanagari written for Kannada ...... 0.00
+#     WRONG - Latin transliteration ............... 0.00
+# A genuinely wrong script scores zero, so anything in (0.00, 0.54] splits
+# the two cases. 0.50 keeps margin on both sides.
+ASR_SCRIPT_THRESHOLD = 0.50
+
+# Peak amplitude across the whole clip. Below this, nobody actually spoke:
+# Whisper hallucinates confident sentences out of silence.
+SILENCE_PEAK = 0.01
+
+# ffmpeg is NOT a Python package - Whisper shells out to the binary to decode
+# audio. Resolve it once at start-up so a missing install is reported plainly
+# instead of surfacing as a bare WinError 2 from inside whisper.load_audio().
+FFMPEG_PATH = shutil.which("ffmpeg")
 
 
 # ============================================================
@@ -96,6 +129,16 @@ except Exception as e:
     whisper_model = None
     print("ERROR LOADING WHISPER:", str(e))
 
+if FFMPEG_PATH:
+    print("ffmpeg:", FFMPEG_PATH)
+else:
+    print("WARNING: ffmpeg was NOT found on PATH.")
+    print("         Whisper cannot decode audio without it, so every")
+    print("         /transcribe request will fail. Install it with:")
+    print("             winget install Gyan.FFmpeg     (Windows)")
+    print("             brew install ffmpeg            (macOS)")
+    print("             sudo apt install ffmpeg        (Debian/Ubuntu)")
+
 
 # ============================================================
 # BASIC ROUTES
@@ -108,10 +151,15 @@ def root():
 
 @app.get("/health")
 def health():
+    voice_ready = whisper_model is not None and FFMPEG_PATH is not None
     return {
-        "status": "ok",
+        # "ok" used to be reported even with no Whisper and no ffmpeg, which
+        # made the health check useless for diagnosing a dead voice feature.
+        "status": "ok" if voice_ready else "degraded",
+        "voice_ready": voice_ready,
         "whisper_loaded": whisper_model is not None,
         "whisper_model": WHISPER_MODEL_NAME,
+        "ffmpeg": FFMPEG_PATH,
         "ollama_model": OLLAMA_MODEL,
     }
 
@@ -272,7 +320,7 @@ def script_ok(text: str, code: str, threshold: float = 0.9) -> bool:
     letters = [c for c in text if c.isalpha()]
     if not letters:
         return False
-    if code == "en":
+    if code == "en" or code not in SCRIPT_RANGES:
         good = sum(1 for c in letters if c.isascii())
     else:
         lo, hi = SCRIPT_RANGES[code]
@@ -498,20 +546,25 @@ def old_chat_endpoint(request_data: dict):
 
 def choose_language(probs: dict, hint: str = None):
     """
-    probs : {lang_code: probability} from Whisper (any codes)
+    probs : {lang_code: probability} from Whisper (all 99 of its languages)
     hint  : language code the user selected in the app (or None)
 
-    Returns (chosen_code, detected_code, restricted_probs)
+    Returns (chosen_code, detected_code, restricted_probs, low_confidence)
 
     - Only our 6 supported languages are considered.
     - Best Whisper guess wins, EXCEPT when both the guess and the user's
       hint are Indian languages and the hint is a plausible runner-up
       (>= HINT_BIAS * best). English is never overridden in either direction,
       so English speech with Kannada selected still comes out as English.
+    - low_confidence is True when even the winner scored under
+      MIN_LANG_CONFIDENCE. HINT_BIAS is a RELATIVE test with no floor, so on
+      silence or an unsupported language it used to promote a hint sitting at
+      a probability of 0.002 and present it as a detection.
     """
     restricted = {c: float(probs.get(c, 0.0)) for c in SUPPORTED}
     detected = max(restricted, key=restricted.get)
     chosen = detected
+    low_confidence = restricted[detected] < MIN_LANG_CONFIDENCE
 
     if (
         hint in restricted
@@ -522,13 +575,25 @@ def choose_language(probs: dict, hint: str = None):
     ):
         chosen = hint
 
-    return chosen, detected, restricted
+    # Nothing was recognised with any real confidence. Deferring to the
+    # language the user actually chose beats transcribing in one picked out
+    # of statistical noise.
+    if low_confidence and hint in restricted:
+        chosen = hint
+
+    return chosen, detected, restricted, low_confidence
 
 
-def detect_spoken_language(path: str, hint: str = None):
-    audio = whisper.pad_or_trim(whisper.load_audio(path))
+def detect_spoken_language(audio, hint: str = None):
+    """`audio` is an already-decoded waveform, NOT a path.
+
+    It used to take a path and call whisper.load_audio() itself, which meant
+    ffmpeg decoded the same clip two or three times per request.
+    """
     n_mels = getattr(whisper_model.dims, "n_mels", 80)
-    mel = whisper.log_mel_spectrogram(audio, n_mels=n_mels).to(whisper_model.device)
+    mel = whisper.log_mel_spectrogram(
+        whisper.pad_or_trim(audio), n_mels=n_mels
+    ).to(whisper_model.device)
     _, probs = whisper_model.detect_language(mel)
     return choose_language(probs, hint)
 
@@ -547,9 +612,9 @@ WHISPER_PROMPTS = {
 }
 
 
-def run_whisper(path, lang, prompt=None):
+def run_whisper(audio, lang, prompt=None):
     result = whisper_model.transcribe(
-        path,
+        audio,
         language=lang,
         task="transcribe",
         fp16=False,
@@ -562,21 +627,30 @@ def run_whisper(path, lang, prompt=None):
     return " ".join(result.get("text", "").split()).strip()
 
 
-def transcribe_with_guard(path, lang):
+def transcribe_with_guard(audio, lang):
     """
     Transcribe in `lang`. If the text comes out in the WRONG SCRIPT
     (e.g. Devanagari letters for Kannada speech), retry once with a short
     prompt written in the right script. Returns (text, warning_or_None).
-    """
-    text = run_whisper(path, lang)
 
-    if lang == "en" or not text or script_ok(text, lang):
+    Judged at ASR_SCRIPT_THRESHOLD, not the 0.9 used for generated text:
+    a transcription like "ಸಕ್ಕರೆ ಕಾಯಿಲೆ ಇದೆ, sugar tablet ತಗೋತೀನಿ" is a
+    correct rendering of what was said, and 0.9 flagged it as an error.
+
+    Note this cannot separate Hindi from Marathi - both are Devanagari, so
+    SCRIPT_RANGES gives them the identical range and the guard is a no-op
+    between those two. Only Whisper's own acoustic detection distinguishes
+    them.
+    """
+    text = run_whisper(audio, lang)
+
+    if lang == "en" or not text or script_ok(text, lang, ASR_SCRIPT_THRESHOLD):
         return text, None
 
     print(f"Wrong script for {lang}: {text[:60]!r} -> retrying with script prompt")
-    retry = run_whisper(path, lang, WHISPER_PROMPTS.get(lang))
+    retry = run_whisper(audio, lang, WHISPER_PROMPTS.get(lang))
 
-    if retry and script_ok(retry, lang):
+    if retry and script_ok(retry, lang, ASR_SCRIPT_THRESHOLD):
         return retry, None
 
     return (retry or text), (
@@ -589,75 +663,134 @@ def transcribe_with_guard(path, lang):
 # WHISPER VOICE TRANSCRIPTION
 # ============================================================
 
+def _fail(message: str, status: int = 400, **extra):
+    """Error replies now carry a real HTTP status.
+
+    Every failure used to come back as 200 with {"success": false}, so any
+    client using raise_for_status() - including ai/testai.py - read a dead
+    request as a successful one.
+    """
+    body = {"success": False, "text": "", "error": message}
+    body.update(extra)
+    return JSONResponse(status_code=status, content=body)
+
+
 @app.post("/transcribe")
 def transcribe_audio(
     file: UploadFile = File(...),
     language: str = Form(""),      # the language selected in the app (hint)
-    force: str = Form("0"),        # "1" = trust the app language, skip auto-detection
+    force: str = Form("0"),        # "1" = trust the app language for transcription
 ):
     temp_file_path = None
 
     try:
         if whisper_model is None:
-            return {"success": False, "text": "", "error": "Whisper model is not loaded."}
+            return _fail("Whisper model is not loaded. Check the backend log.", 503)
+
+        if not FFMPEG_PATH:
+            return _fail(
+                "ffmpeg is not installed or not on PATH, so the recording cannot "
+                "be decoded. Install ffmpeg and restart the backend.", 503)
 
         hint = normalize_language(language, default=None) if language else None
 
         audio_bytes = file.file.read()
         if not audio_bytes:
-            return {"success": False, "text": "", "error": "No audio data received."}
+            return _fail("No audio data received.", 400)
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        # Keep the client's real extension. Forcing ".wav" onto WebM/Opus bytes
+        # left ffmpeg to sniff the container past a lying filename.
+        suffix = os.path.splitext(file.filename or "")[1].lower() or ".wav"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         tmp.write(audio_bytes)
         tmp.close()
         temp_file_path = tmp.name
 
         t0 = time.time()
 
-        # 1) which language was actually spoken?
-        if force == "1" and hint:
-            chosen, detected, probs = hint, hint, {hint: 1.0}
-            print("FORCED language from app:", hint)
-        else:
-            chosen, detected, probs = detect_spoken_language(temp_file_path, hint)
+        # Decode ONCE and reuse the waveform for detection and transcription.
+        try:
+            audio = whisper.load_audio(temp_file_path)
+        except Exception as e:
+            return _fail(f"Could not decode the audio ({e}). Please record again.", 400)
 
+        # Whisper invents fluent sentences out of silence, so refuse the clip
+        # rather than hand the chat model a hallucination.
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak < SILENCE_PEAK:
+            return _fail(
+                "No speech was detected in that recording. Please record again and "
+                "speak closer to the microphone.", 400,
+                peak=round(peak, 5), language=hint)
+
+        # 1) which language was actually spoken?
+        chosen, detected, probs, low_confidence = detect_spoken_language(audio, hint)
+
+        # "Force" decides which language we TRANSCRIBE in. It must not overwrite
+        # what Whisper actually heard: the old code set detected = hint too, so
+        # hint_mismatch could never fire under force and the UI was handed a
+        # fabricated {hint: 1.0} that it displayed as "100% confidence".
+        forced = force == "1" and bool(hint)
+        if forced:
+            chosen = hint
+
+        supported_mass = sum(probs.values())
         top3 = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:3]
+
         print("==========================================")
         print("VOICE REQUEST")
         print("Model          :", WHISPER_MODEL_NAME)
-        print("Audio size     :", len(audio_bytes), "bytes")
-        print("App hint       :", hint, "| forced:", force == "1")
+        print("Audio size     :", len(audio_bytes), "bytes |", suffix)
+        print("Peak amplitude :", round(peak, 4))
+        print("App hint       :", hint, "| forced:", forced)
         print("Whisper top-3  :", [(c, round(p, 3)) for c, p in top3])
-        print("Whisper pick   :", detected)
+        print("Supported mass :", round(supported_mass, 3))
+        print("Whisper pick   :", detected, "| low confidence:", low_confidence)
         print("Language used  :", chosen)
         print(f"Detection took : {time.time() - t0:.1f}s")
         print("==========================================")
 
         # 2) transcribe in that language (with wrong-script guard)
-        text, warning = transcribe_with_guard(temp_file_path, chosen)
+        text, warning = transcribe_with_guard(audio, chosen)
 
         print("Text:", text)
         print(f"Total /transcribe time: {time.time() - t0:.1f}s")
 
         if not text:
-            return {"success": False, "text": "", "language": chosen,
-                    "error": "Could not understand the audio."}
+            return _fail("Could not understand the audio.", 400, language=chosen)
+
+        if low_confidence and not warning:
+            warning = (
+                "I could not confidently tell which language that was. "
+                f"I transcribed it as {LANGUAGE_NAMES.get(chosen, chosen)} - "
+                "please check the text below before sending it."
+            )
 
         return {
             "success": True,
             "text": text,
             "language": chosen,               # code used for transcription + reply
             "detected_language": detected,    # raw Whisper guess (for debugging)
+            "forced": forced,
+            "low_confidence": low_confidence,
+            # Raw Whisper probabilities restricted to our six languages. These
+            # do NOT sum to 1 - supported_mass is how much of Whisper's total
+            # belief landed on a language Neravu supports at all. The UI used
+            # to render them as percentages, implying they did.
             "probabilities": {c: round(p, 3) for c, p in top3},
+            "supported_mass": round(supported_mass, 3),
             "warning": warning,
-            # heard a different Indian language than the one selected in the app
-            "hint_mismatch": bool(hint and hint != chosen and hint != "en" and chosen != "en"),
+            # Compared against what Whisper HEARD, not against the language we
+            # transcribed in - otherwise forcing always silenced this.
+            "hint_mismatch": bool(
+                hint and hint != detected and hint != "en" and detected != "en"
+            ),
             "app_language": hint,
         }
 
     except Exception as e:
         print("WHISPER ERROR:", str(e))
-        return {"success": False, "text": "", "error": str(e)}
+        return _fail(str(e), 500)
 
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
