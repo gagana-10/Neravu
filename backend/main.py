@@ -7,7 +7,20 @@ import os
 import shutil
 import tempfile
 import requests
+import sys
 import time
+
+# Neravu transcribes Kannada, Hindi, Tamil, Telugu and Marathi, and every
+# request logs the text it produced. On Windows the console is cp1252, so
+# print()ing that text raised UnicodeEncodeError ("charmap codec can't
+# encode characters..."), the handler caught it, and a perfectly good
+# transcription came back to the user as a 500. Logging must never be able
+# to fail a request.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import numpy as np
 import torch
