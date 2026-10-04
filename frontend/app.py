@@ -1,4 +1,3 @@
-
 import streamlit as st
 import requests
 
@@ -37,8 +36,7 @@ LANGUAGES = {
 }
 
 
-# Gemini transcription returns a language code/name depending
-# on the backend implementation.
+# Gemini transcription returns a language code/name
 CODE_TO_NAME = {
     "en": "English",
     "kn": "Kannada",
@@ -125,14 +123,18 @@ def clear_voice_state():
     st.session_state.voice_urgent = False
 
 
-def transcribe_audio(audio_bytes):
+# =========================================================
+# CHANGED VOICE TRANSCRIPTION FUNCTION
+# =========================================================
+
+def transcribe_audio(audio_bytes, language):
 
     """
     Send recorded audio to FastAPI.
 
-    FastAPI -> Gemini 3.5 Transcribe
-
-    Gemini automatically detects the spoken language.
+    The selected language is sent to the backend.
+    Force mode makes Gemini transcribe using that
+    selected language.
     """
 
     response = requests.post(
@@ -147,6 +149,11 @@ def transcribe_audio(audio_bytes):
             )
         },
 
+        data={
+            "language": language,
+            "force": "1"
+        },
+
         timeout=300,
     )
 
@@ -158,7 +165,7 @@ def get_ai_response(text, language):
     """
     Send text to FastAPI.
 
-    FastAPI -> RAG -> Gemini 3.8 Flash
+    FastAPI -> RAG -> Gemini
     """
 
     return send_message(
@@ -463,8 +470,8 @@ elif st.session_state.page == "voice":
         "Reply in the language I speak",
         value=True,
         help=(
-            "Gemini detects the language you speak. "
-            "When enabled, Neravu replies in that language."
+            "The selected language is used for speech "
+            "transcription and the Neravu response."
         ),
     )
 
@@ -538,8 +545,13 @@ elif st.session_state.page == "voice":
 
                 try:
 
+                    # IMPORTANT:
+                    # Send the currently selected language
+                    # to the backend.
+
                     response = transcribe_audio(
-                        audio_value.getvalue()
+                        audio_value.getvalue(),
+                        st.session_state.language
                     )
 
 
@@ -580,7 +592,7 @@ elif st.session_state.page == "voice":
                                 or data.get(
                                     "detected_language"
                                 )
-                                or ""
+                                or st.session_state.language
                             )
 
 
@@ -606,7 +618,7 @@ elif st.session_state.page == "voice":
                             )
 
 
-                            # Show Gemini detection
+                            # Show language
 
                             detected_name = (
                                 language_name_from_code(
@@ -616,7 +628,7 @@ elif st.session_state.page == "voice":
 
 
                             st.info(
-                                f"🌐 Gemini detected: "
+                                f"🌐 Gemini is using: "
                                 f"**{detected_name}**"
                             )
 
@@ -639,7 +651,7 @@ elif st.session_state.page == "voice":
 
                     st.info(
                         "Start FastAPI first:\n\n"
-                        "`uvicorn main:app --reload --port 8000`"
+                        "`python -m uvicorn backend.main:app --reload`"
                     )
 
 
@@ -702,7 +714,7 @@ elif st.session_state.page == "voice":
 
 
             st.write(
-                f"🌐 Detected spoken language: "
+                f"🌐 Spoken language: "
                 f"**{detected_name}**"
             )
 
@@ -1207,4 +1219,3 @@ elif st.session_state.page == "emergency":
         It is not a replacement for emergency medical services.
         """
     )
-
