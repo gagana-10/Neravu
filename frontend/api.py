@@ -5,7 +5,7 @@ import requests
 # BACKEND URL
 # =========================================================
 
-API_URL = "http://127.0.0.1:8000"
+API_URL = "https://neravu-new.onrender.com"
 
 
 # =========================================================
@@ -41,8 +41,7 @@ def send_message(
 
         raise Exception(
             "Neravu backend is not running. "
-            "Start FastAPI using: "
-            "uvicorn main:app --reload"
+            "Please try again in a moment."
         )
 
     except requests.exceptions.Timeout:
